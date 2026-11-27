@@ -2,6 +2,7 @@
 import logging
 from contextlib import contextmanager
 from pathlib import Path
+from pathlib import PureWindowsPath
 import os
 
 from libs.OpenShift.LP.Virt.VM.VM import VM
@@ -61,12 +62,14 @@ class WinStress:
         diskspdArchive = self.cfg.diskspdArchive
         diskspdUrl = self.cfg.diskspdUrl
         try:
+            diskspdDir = self.winVM.EnsurePath(diskspdDir)
             logs.info('Checking if DiskSpd already exists...')
             result = self.vm.ssh.RunPowerShell(
-                f'Test-Path -Path "{diskspdExe}" -PathType Leaf'
-            )
-            if result.success and result.stdout.strip().lower() == 'true':
-                logs.info('DiskSpd already exists')
+                    f'Get-ChildItem -Path {diskspdDir} -Filter {diskspdExe} -Recurse -File'
+                    f'| Select-Object -ExpandProperty FullName'
+                )
+            if result.success and result.stdout.strip():
+                logs.info(f'DiskSpd executable already exists: {result.stdout.strip()}')
                 return True
 
             logs.info('DiskSpd not found, downloading...')
@@ -79,41 +82,62 @@ class WinStress:
                 return False
 
             logs.info('Extracting DiskSpd...')
-            result = self.winVM.ExtractArchive(diskspdArchive)
+            archivePath = PureWindowsPath(diskspdDir) / diskspdArchive
+            result = self.winVM.ExtractArchive(archivePath)
             if not result:
                 logs.error(f'Failed to extract DiskSpd: {result.stderr}')
                 return False
 
             logs.info('Verifying DiskSpd executable...')
             result = self.vm.ssh.RunPowerShell(
-                f'Test-Path -Path "{diskspdExe}" -PathType Leaf'
+                f'Get-ChildItem -Path {diskspdDir} -Filter {diskspdExe} -Recurse -File'
+                f'| Select-Object -ExpandProperty FullName'
+            )
+            if not result.success :
+                logs.error(f'DiskSpd verification failed: executable not found at {diskspdDir}')
+                return False
+            exePath = result.stdout.strip()
+            result = self.vm.ssh.RunPowerShell(
+                f'Test-Path -Path "{exePath}" -PathType Leaf'
             )
             if not result.success or result.stdout.strip().lower() == 'false':
-                logs.error(f'DiskSpd verification failed: executable not found at {diskspdExe}')
+                logs.error(f'DiskSpd verification failed: executable not found at {diskspdDir}')
                 return False
-
             logs.info('DiskSpd successfully downloaded and verified')
             return True
         except Exception as error:
             logs.error(f'Unexpected error downloading DiskSpd: {error}')
             return False
 
-    def TriggerDiskspdScheduledTask(self) -> tuple[bool, str]:
+    def TriggerDiskspdScheduledTask(self, request) -> tuple[bool, str]:
         '''Create and start a scheduled task for DiskSpd.'''
         if not self.DownloadDiskspd():
             return False, "Download Failed"
+        diskspdScript = (request.config.rootpath / 'scripts' / self.cfg.diskspdScript).resolve()
+        diskspdVMScript = self.winVM.EnsurePath(f"$env:HOMEDRIVE\\{self.cfg.diskspdScript}", isFile=True)
+        if not diskspdVMScript:
+            return False, "Not able to esnure diskspd script path"
+        logs.info(f'Ensured diskspd script path:{diskspdVMScript}')
+        if not self.winVM.SendFile(
+            sourceFilePath=diskspdScript,
+            destFilePath=diskspdVMScript,
+            verify=True
+        ):
+            return False, "Trigger script upload failed"
+
         result = self.winVM.ScheduledTaskTrigger(
             taskName=self.cfg.taskName, 
+            diskspdScript=diskspdVMScript,
             args=self.cfg.taskArgs
         )
         return result.success, result.stderr if not result.success else ''
         
     def KillDiskspd(self) -> bool:
         '''Get the parent Id of diskspd proces and kill the process tree.'''
-        if not self.winVM.IsProcRunning(procName="diskspd.exe"):
+        if not self.winVM.IsProcRunning(procName=self.cfg.diskspdExe):
             logs.error(f'Process diskspd is not found running')
             return False
-        ppid = self.winVM.GetPpid(procName="diskspd.exe")
+        ppid = self.winVM.GetPpid(procName=self.cfg.diskspdExe)
         logs.info(f'DiskSpd PPID: {ppid}')
         return self.winVM.KillPidTree(pid=ppid)
         
@@ -132,5 +156,5 @@ class WinStress:
             try:
                 self.KillDiskspd()
                 self.DeleteDiskSpdTask()
-            except Exception as e:
-                logs.error(f'Cleanup failed: {e}')
+            except Exception as error:
+                logs.error(f'Cleanup failed: {error}')

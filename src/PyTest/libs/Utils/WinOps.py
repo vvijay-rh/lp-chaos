@@ -1,5 +1,7 @@
 '''Windows VM Stress testing utilities.'''
 import logging
+from pathlib import Path
+from pathlib import PureWindowsPath
 
 from libs.OpenShift.LP.Virt.VM.VM import VM
 from libs.Utils.CmdExec import CmdRes
@@ -42,14 +44,13 @@ class WinOps:
                 '  Invoke-WebRequest '
                 '  -Uri $url '
                 '  -OutFile $outFile -TimeoutSec 300 -ErrorAction Stop; '
-                '  Write-Output "Downloaded: $(Test-Path -Path $outFile -PathType Leaf)"; '
                 '} catch { '
                 '  Write-Error "Download failed: $_"; '
                 '  exit 1; '
                 '}'
             )
-            if result.success and 'True' not in result.stdout:
-                logs.error(f'Download verification failed: file not found after download')
+            if not result.success :
+                logs.error(f'Download failed: {result.stderr}')
                 return False
             result = self.vm.ssh.RunPowerShell(
                 f'$filename = Split-Path -Leaf "{url}"; '
@@ -78,7 +79,7 @@ class WinOps:
                     f'Test-Path -Path "{archivePath}" -PathType Leaf'
             )
             if result.success and result.stdout.strip().lower() != 'true':
-                logs.error(f'Failed to extract {archivePath}: {result.stderr}')
+                logs.error(f'File not found, failed to extract {archivePath}: {result.stderr}')
                 return False
             logs.info('Extracting {archivePath}...')
             result = self.vm.ssh.RunPowerShell(
@@ -100,7 +101,7 @@ class WinOps:
             logs.error(f'Unexpected error during extraction: {error}')
             return False
 
-    def ScheduledTaskTrigger(self, taskName: str, args: str) -> CmdRes:
+    def ScheduledTaskTrigger(self, taskName: str, diskspdScript: str, args: str) -> CmdRes:
         '''
         Create and immediately start a scheduled task.
 
@@ -113,7 +114,7 @@ class WinOps:
         result = self.vm.ssh.RunPowerShell(
                 f'$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date); '
                 f'$action = New-ScheduledTaskAction -Execute "powershell.exe" '
-                f'-Argument "{args}"; '
+                f'-Argument "-NoProfile -File {diskspdScript} {args}"; '
                 f'Register-ScheduledTask -TaskName "{taskName}" -Trigger $trigger -Action $action -Force; '
                 f'Start-ScheduledTask -TaskName "{taskName}"'
         )
@@ -214,10 +215,156 @@ class WinOps:
         :return:            True if running; False otherwise.
         '''
         try:
+            name = Path(procName).stem
             result = self.vm.ssh.RunPowerShell(
-                f'Get-Process -Name {procName} -ErrorAction SilentlyContinue | Select-Object -First 1'
+                f'Get-Process -Name {name} -ErrorAction SilentlyContinue | Select-Object -First 1'
             )
             return result.success and bool(result.stdout.strip())
         except Exception as error:
             logs.error(f'Failed to check process status {procName}: {error}')
+            return False
+
+    def ResolvePath(self, destPath: str) -> str | None:
+        # Expand environment variables in destination path
+        logs.info('Resolving the destination path...')
+        result = self.vm.ssh.RunPowerShell(
+            f'Write-Output ([Environment]::ExpandEnvironmentVariables("{destPath}"))'
+        )
+        if not result.success or not result.stdout.strip():
+            logs.error(f'Failed to expand path: {destPath}')
+            return None
+        return result.stdout.strip()
+
+    def EnsurePath(self, destPath: str, isFile: bool = False) -> str | None:
+        '''
+        Expand environment variables, verify path exists, and create if needed.
+
+        :param destPath:    Path with potential $env: variables (file or folder).
+        :param isFile:      If True, treat as file path and create parent directory.
+                            If False, treat as folder path and create it.
+        :return:            Expanded path if successful; None if failed.
+        '''
+        try:
+            logs.info(f'Resolving {"file" if isFile else "folder"} path: {destPath}')
+
+            expandedPath = self.ResolvePath(destPath)
+            if not expandedPath :
+                return None
+
+            logs.info(f'Expanded: {destPath} -> {expandedPath}')
+
+            if isFile:
+                # For file path, check/create parent directory
+                checkPath = str(PureWindowsPath(expandedPath).parent)
+                #checkPath = f'Split-Path -Path "{expandedPath}" -Parent'
+                pathType = 'Directory (parent of file)'
+            else:
+                # For folder path, check/create the path itself
+                checkPath = f'"{expandedPath}"'
+                pathType = 'Directory'
+
+            result = self.vm.ssh.RunPowerShell(
+                f'Test-Path -Path {checkPath} -PathType Container'
+            )
+
+            if result.success and result.stdout.strip().lower() == 'true':
+                logs.info(f'{pathType} already exists: {expandedPath}')
+                return expandedPath
+
+            logs.info(f'{pathType} does not exist, creating: {expandedPath}')
+            if isFile:
+                # Create parent directory for file
+                result = self.vm.ssh.RunPowerShell(
+                    f'try {{ '
+                    f'  $parentDir = Split-Path -Path "{expandedPath}" -Parent; '
+                    f'  New-Item -Path $parentDir -ItemType Directory -Force | Out-Null; '
+                    f'  Write-Output "Created"; '
+                    f'}} catch {{ '
+                    f'  Write-Error "Creation failed: $_"; exit 1; '
+                    f'}}'
+                )
+            else:
+                # Create directory
+                result = self.vm.ssh.RunPowerShell(
+                    f'try {{ '
+                    f'  New-Item -Path "{expandedPath}" -ItemType Directory -Force | Out-Null; '
+                    f'  Write-Output "Created"; '
+                    f'}} catch {{ '
+                    f'  Write-Error "Creation failed: $_"; exit 1; '
+                    f'}}'
+                )
+
+            if not result.success or 'Created' not in result.stdout:
+                logs.error(f'Failed to create {pathType}: {expandedPath}')
+                return None
+
+            logs.info(f'{pathType} created successfully: {expandedPath}')
+            return expandedPath
+
+        except Exception as error:
+            logs.error(f'Unexpected error resolving path: {error}')
+            return None
+
+    def SendFile(self, sourceFilePath: str, destFilePath: str, verify: bool = True) -> bool:
+        '''
+        Send file from host to VM destination folder.
+
+        :param sourceFilePath:  Path to source file on host (absolute or expandable).
+        :param destPath:        Destination file path on VM.
+        :param verify:          Verify file exists on VM after transfer.
+        :return:                True if transfer successful; False otherwise.
+        '''
+        import os
+        from pathlib import Path
+        try:
+            # Expand and validate source file
+            sourcePath = Path(os.path.expanduser(sourceFilePath)).resolve()
+            if not sourcePath.is_file():
+                logs.error(f'Source file not found: {sourcePath}')
+                return False
+
+            fileSize = sourcePath.stat().st_size
+            logs.info(f'Sending {sourcePath.name} ({fileSize} bytes) to VM: {destFilePath}')
+
+            # Ensure destination directory exists on VM
+            resolvedFilePath = self.EnsurePath(destPath=destFilePath, isFile=True)
+            if not resolvedFilePath:
+                return False
+
+            # Send file using VM's SSH connection
+            logs.info(f'Transferring file to: {resolvedFilePath}')
+            result = self.vm.ssh.Send(str(sourcePath), resolvedFilePath)
+
+            if not result:
+                logs.error(f'Failed to send file: {sourcePath.name}')
+                return False
+
+            logs.info(f'File sent successfully: {resolvedFilePath}')
+
+            # Verify file on VM
+            if verify:
+                logs.info(f'Verifying file on VM: {resolvedFilePath}')
+                result = self.vm.ssh.RunPowerShell(
+                    f'Test-Path -Path "{resolvedFilePath}" -PathType Leaf'
+                )
+                if not result.success or result.stdout.strip().lower() != 'true':
+                    logs.error(f'File verification failed: {resolvedFilePath}')
+                    return False
+
+                # Check file size matches
+                result = self.vm.ssh.RunPowerShell(
+                    f'(Get-Item "{resolvedFilePath}").Length'
+                )
+                if result.success:
+                    remoteSize = int(result.stdout.strip())
+                    if remoteSize != fileSize:
+                        logs.error(
+                            f'File size mismatch: local={fileSize}, remote={remoteSize}'
+                        )
+                        return False
+
+                logs.info(f'File verified on VM: {resolvedFilePath}')
+            return True
+        except Exception as error:
+            logs.error(f'Unexpected error sending file: {error}')
             return False
