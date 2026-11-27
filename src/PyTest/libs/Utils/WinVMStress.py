@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from pathlib import PureWindowsPath
 import os
+from typing import Generator
 
 from libs.OpenShift.LP.Virt.VM.VM import VM
 from libs.OpenShift.OCP.CLI.OC import OCcli
@@ -146,15 +147,47 @@ class WinStress:
         return self.winVM.DeleteTask(taskName=self.cfg.taskName)
 
     @contextmanager
-    def DiskSpdContext(self):
-        '''Context manager for DiskSpd lifecycle.'''
+    def DiskSpdContext(self) -> Generator[WinStress, None, None]:
+        '''
+        Context manager for DiskSpd lifecycle.
+
+        Automatically triggers DiskSpd and cleans up on exit.
+
+        :param timeout_seconds: How long to run DiskSpd before cleanup.
+        :yield: Self for use in with block.
+        :raises RuntimeError: If DiskSpd trigger fails.
+        '''
         try:
-            if not self.TriggerDiskspdScheduledTask():
-                raise RuntimeError('Failed to trigger DiskSpd')
+            success, errorMsg = self.TriggerDiskspdScheduledTask()
+            if not success:
+                raise RuntimeError(f'Failed to trigger DiskSpd: {errorMsg}')
+
+            logs.info(f'DiskSpd running')
             yield self
+
         finally:
-            try:
-                self.KillDiskspd()
-                self.DeleteDiskSpdTask()
-            except Exception as error:
-                logs.error(f'Cleanup failed: {error}')
+            logs.info('Starting DiskSpd cleanup...')
+            cleanupErrors = []
+
+        try:
+            if self.KillDiskspd():
+                logs.info('DiskSpd process killed successfully')
+            else:
+                logs.warning('Failed to kill DiskSpd process')
+                cleanupErrors.append('Kill process failed')
+        except Exception as error:
+            logs.error(f'Error killing DiskSpd: {error}')
+            cleanupErrors.append(str(error))
+
+        try:
+            if self.DeleteDiskSpdTask():
+                logs.info('DiskSpd task deleted successfully')
+            else:
+                logs.warning('Failed to delete DiskSpd task')
+                cleanupErrors.append('Delete task failed')
+        except Exception as error:
+            logs.error(f'Error deleting task: {error}')
+            cleanupErrors.append(str(error))
+
+        if cleanupErrors:
+            logs.warning(f'Cleanup completed with errors: {cleanupErrors}')
